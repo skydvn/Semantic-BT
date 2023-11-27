@@ -1,82 +1,89 @@
-from PIL import Image, ImageOps, ImageFilter
+from functools import partial
+from typing import Sequence, Tuple, Union
+
+import lightning as L
+import matplotlib.pyplot as plt
+import numpy as np
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
 import torchvision.transforms as transforms
-import random
-'''
-#####
-Adapted from https://github.com/facebookresearch/barlowtwins
-#####
-'''
+import torchvision.transforms.functional as VisionF
+from pytorch_lightning import Callback, LightningModule, Trainer
+from pytorch_lightning.callbacks import ModelCheckpoint
+from torch import Tensor
+from torch.utils.data import DataLoader
+from torchmetrics.functional import accuracy
+from torchvision.datasets import CIFAR10
+from torchvision.models.resnet import resnet34
+from torchvision.utils import make_grid
+from torchvision import models
+from torchsummary import summary
+from pytorch_lightning.loggers import CSVLogger
+from tqdm import tqdm
 
 
-class GaussianBlur(object):
-    def __init__(self, p):
-        self.p = p
+class BarlowTwinsTransform:
+    def __init__(self, train=True, input_height=224, gaussian_blur=True, jitter_strength=1.0, normalize=None):
+        self.input_height = input_height
+        self.gaussian_blur = gaussian_blur
+        self.jitter_strength = jitter_strength
+        self.normalize = normalize
+        self.train = train
 
-    def __call__(self, img):
-        if random.random() < self.p:
-            sigma = random.random() * 1.9 + 0.1
-            return img.filter(ImageFilter.GaussianBlur(sigma))
+        color_jitter = transforms.ColorJitter(
+            0.8 * self.jitter_strength,
+            0.8 * self.jitter_strength,
+            0.8 * self.jitter_strength,
+            0.2 * self.jitter_strength,
+        )
+
+        color_transform = [transforms.RandomApply([color_jitter], p=0.8), transforms.RandomGrayscale(p=0.2)]
+
+        if self.gaussian_blur:
+            kernel_size = int(0.1 * self.input_height)
+            if kernel_size % 2 == 0:
+                kernel_size += 1
+
+            color_transform.append(transforms.RandomApply([transforms.GaussianBlur(kernel_size=kernel_size)], p=0.5))
+
+        self.color_transform = transforms.Compose(color_transform)
+
+        if normalize is None:
+            self.final_transform = transforms.ToTensor()
         else:
-            return img
+            self.final_transform = transforms.Compose([transforms.ToTensor(), normalize])
 
-
-class Solarization(object):
-    def __init__(self, p):
-        self.p = p
-
-    def __call__(self, img):
-        if random.random() < self.p:
-            return ImageOps.solarize(img)
-        else:
-            return img
-
-
-class Transform:
-    def __init__(self, transform=None, transform_prime=None):
-        '''
-
-        :param transform: Transforms to be applied to first input
-        :param transform_prime: transforms to be applied to second
-        '''
-        if transform == None:
-            self.transform = transforms.Compose([
-                transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
+        self.transform = transforms.Compose(
+            [
+                transforms.RandomResizedCrop(self.input_height),
                 transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomApply(
-                    [transforms.ColorJitter(brightness=0.4, contrast=0.4,
-                                            saturation=0.2, hue=0.1)],
-                    p=0.8
-                ),
-                transforms.RandomGrayscale(p=0.2),
-                GaussianBlur(p=1.0),
-                Solarization(p=0.0),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ])
-        else:
-            self.transform = transform
-        if transform_prime == None:
+                self.color_transform,
+                self.final_transform,
+            ]
+        )
 
-            self.transform_prime = transforms.Compose([
-                transforms.RandomResizedCrop(224, interpolation=Image.BICUBIC),
-                transforms.RandomHorizontalFlip(p=0.5),
-                transforms.RandomApply(
-                    [transforms.ColorJitter(brightness=0.4, contrast=0.4,
-                                            saturation=0.2, hue=0.1)],
-                    p=0.8
-                ),
-                transforms.RandomGrayscale(p=0.2),
-                GaussianBlur(p=0.1),
-                Solarization(p=0.2),
-                transforms.ToTensor(),
-                transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
-            ])
+        self.finetune_transform = None
+        if self.train:
+            self.finetune_transform = transforms.Compose(
+                [
+                    transforms.RandomCrop(32, padding=4, padding_mode="reflect"),
+                    transforms.RandomHorizontalFlip(),
+                    transforms.ToTensor(),
+                ]
+            )
         else:
-            self.transform_prime = transform_prime
+            self.finetune_transform = transforms.ToTensor()
 
-    def __call__(self, x):
-        y1 = self.transform(x)
-        y2 = self.transform_prime(x)
-        return y1, y2
+    def __call__(self, sample):
+        return self.transform(sample), self.transform(sample), self.finetune_transform(sample)
+
+
+def cifar10_normalization():
+    normalize = transforms.Normalize(
+        mean=[x / 255.0 for x in [125.3, 123.0, 113.9]], std=[x / 255.0 for x in [63.0, 62.1, 66.7]]
+    )
+    return normalize
+
+
